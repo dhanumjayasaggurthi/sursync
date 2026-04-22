@@ -17,10 +17,17 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Python 3.10 (Ubuntu 22.04 default) + ffmpeg
+# libcublas-12-1 is required by CTranslate2 / faster-whisper for CUDA inference.
+# It is normally included in the runtime image but we pin it explicitly to be safe.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip ffmpeg curl \
+        libcublas-12-1 \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-create the cache directory so it exists even if the Network Volume
+# is not mounted (the worker will fall back to this location).
+RUN mkdir -p /runpod-volume/hf-cache
 
 # Python packages
 RUN pip3 install --no-cache-dir --upgrade pip && \

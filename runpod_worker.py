@@ -66,6 +66,33 @@ def _load_model_background() -> None:
 @app.on_event("startup")
 async def startup_event() -> None:
     """Kick off model loading in a daemon thread — server accepts requests immediately."""
+    # Log key env vars so we can see them in pod logs
+    log.info("[worker] WHISPER_MODEL=%s", WHISPER_MODEL)
+    log.info("[worker] HF_HOME=%s", os.environ.get("HF_HOME", "(not set)"))
+
+    # Ensure HF cache directory is writable.
+    # If the RunPod Network Volume isn't mounted, /runpod-volume won't exist —
+    # fall back to /tmp/hf-cache so the server still starts (model re-downloads,
+    # but that is better than a hard crash).
+    hf_home = os.environ.get("HF_HOME", "")
+    if hf_home:
+        try:
+            from pathlib import Path as _P
+            _P(hf_home).mkdir(parents=True, exist_ok=True)
+            log.info("[worker] HF cache dir ready: %s", hf_home)
+        except Exception as exc:
+            fallback = "/tmp/hf-cache"
+            os.environ["HF_HOME"] = fallback
+            try:
+                from pathlib import Path as _P
+                _P(fallback).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            log.warning(
+                "[worker] HF cache dir %s not writable (%s) — falling back to %s",
+                hf_home, exc, fallback,
+            )
+
     t = threading.Thread(target=_load_model_background, daemon=True, name="model-loader")
     t.start()
 
