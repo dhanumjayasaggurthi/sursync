@@ -188,6 +188,40 @@ def wait_for_api(
 # ── Transcription ──────────────────────────────────────────────────────────────
 
 
+def _maybe_compress_to_mp3(audio_path: Path) -> Path:
+    """
+    If audio_path is a WAV, convert it to MP3 (192 kbps) next to the original
+    and return the MP3 path.  WAV → MP3 reduces size ~7× (7 MB → ~1 MB) and
+    avoids SSL EOF errors on the RunPod proxy when uploading large files.
+
+    Returns audio_path unchanged if it is already MP3 or ffmpeg is unavailable.
+    """
+    if audio_path.suffix.lower() != ".wav":
+        return audio_path
+
+    mp3_path = audio_path.with_suffix(".upload.mp3")
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["ffmpeg", "-y", "-i", str(audio_path),
+             "-b:a", "192k", str(mp3_path)],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode == 0 and mp3_path.exists() and mp3_path.stat().st_size > 1000:
+            log.info(
+                "[runpod] Compressed WAV → MP3: %.1f MB → %.1f MB",
+                audio_path.stat().st_size / 1e6,
+                mp3_path.stat().st_size / 1e6,
+            )
+            return mp3_path
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[runpod] WAV→MP3 compression failed (%s) — uploading raw WAV", exc)
+
+    if mp3_path.exists():
+        mp3_path.unlink(missing_ok=True)
+    return audio_path
+
+
 def transcribe(
     base_url: str,
     audio_path: Path,
@@ -230,29 +264,54 @@ def transcribe(
     Raises:
         requests.HTTPError: on non-2xx responses.
     """
-    url  = f"{base_url}/transcribe"
-    size = audio_path.stat().st_size
-    log.info(
-        "[runpod] Uploading %s (%.1f MB) for transcription …",
-        audio_path.name,
-        size / 1e6,
-    )
+    url = f"{base_url}/transcribe"
 
-    params: dict = {}
-    if language:
-        params["language"] = language
-
-    with open(audio_path, "rb") as fh:
-        mime = "audio/wav" if audio_path.suffix.lower() == ".wav" else "audio/mpeg"
-        resp = requests.post(
-            url,
-            files={"file": (audio_path.name, fh, mime)},
-            params=params,
-            timeout=request_timeout_s,
+    # Convert WAV → MP3 before uploading to reduce file size 7x and avoid
+    # SSL EOF errors on the RunPod proxy which drops large uploads.
+    upload_path = _maybe_compress_to_mp3(audio_path)
+    try:
+        size = upload_path.stat().st_size
+        log.info(
+            "[runpod] Uploading %s (%.1f MB) for transcription …",
+            upload_path.name,
+            size / 1e6,
         )
 
-    resp.raise_for_status()
-    result = resp.json()
+        params: dict = {}
+        if language:
+            params["language"] = language
+
+        # Retry up to 3 times — SSL EOF on the RunPod proxy is transient
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(1, 4):
+            try:
+                with open(upload_path, "rb") as fh:
+                    mime = "audio/wav" if upload_path.suffix.lower() == ".wav" else "audio/mpeg"
+                    resp = requests.post(
+                        url,
+                        files={"file": (upload_path.name, fh, mime)},
+                        params=params,
+                        timeout=request_timeout_s,
+                    )
+                resp.raise_for_status()
+                break   # success — exit retry loop
+            except (requests.exceptions.SSLError,
+                    requests.exceptions.ConnectionError) as exc:
+                last_exc = exc
+                if attempt < 3:
+                    wait = attempt * 5
+                    log.warning(
+                        "[runpod] Upload attempt %d failed (%s) — retrying in %ds …",
+                        attempt, exc, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise last_exc from exc
+        result = resp.json()
+    finally:
+        # Remove the compressed temp file if we created one
+        if upload_path != audio_path:
+            upload_path.unlink(missing_ok=True)
 
     total_words = sum(len(seg.get("words", [])) for seg in result.get("segments", []))
     log.info(
