@@ -45,22 +45,37 @@ WHISPER_MODEL: str = os.environ.get("WHISPER_MODEL", "large-v3")
 def _load_model_background() -> None:
     """Load the Whisper model on CUDA in a background thread."""
     global _model, _model_ready, _model_error
-    try:
-        from faster_whisper import WhisperModel  # type: ignore[import]
 
-        log.info("[worker] Loading faster-whisper '%s' on CUDA …", WHISPER_MODEL)
-        m = WhisperModel(
-            WHISPER_MODEL,
-            device="cuda",
-            compute_type="int8_float16",
-        )
-        _model       = m
-        _model_ready = True
-        log.info("[worker] Model '%s' ready ✓", WHISPER_MODEL)
+    # Try progressively safer compute types: best quality → most compatible
+    _CANDIDATES = [
+        ("cuda", "int8_float16"),
+        ("cuda", "float16"),
+        ("cuda", "int8"),
+    ]
 
-    except Exception as exc:  # noqa: BLE001
-        _model_error = str(exc)
-        log.error("[worker] Model load FAILED: %s", exc, exc_info=True)
+    global _model, _model_ready, _model_error
+
+    from faster_whisper import WhisperModel  # type: ignore[import]
+
+    last_exc: Optional[Exception] = None
+    for device, compute_type in _CANDIDATES:
+        try:
+            log.info("[worker] Trying WhisperModel device=%s compute_type=%s …",
+                     device, compute_type)
+            m = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
+            _model       = m
+            _model_ready = True
+            log.info("[worker] Model '%s' ready ✓  (device=%s compute=%s)",
+                     WHISPER_MODEL, device, compute_type)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[worker] device=%s compute=%s failed: %s",
+                        device, compute_type, exc)
+            last_exc = exc
+
+    _model_error = str(last_exc)
+    log.error("[worker] All device/compute combinations failed. Last error: %s",
+              last_exc, exc_info=True)
 
 
 @app.on_event("startup")
@@ -92,6 +107,17 @@ async def startup_event() -> None:
                 "[worker] HF cache dir %s not writable (%s) — falling back to %s",
                 hf_home, exc, fallback,
             )
+
+    # Pre-initialize CUDA context in the main thread.
+    # CTranslate2 can fail with "unknown error" (CUDA error 999) if the CUDA
+    # context is first created from a non-main thread.  Touching ctranslate2
+    # here (main thread) before the background thread starts avoids that race.
+    try:
+        import ctranslate2  # type: ignore[import]
+        n = ctranslate2.get_cuda_device_count()
+        log.info("[worker] CUDA pre-init OK — %d device(s) visible", n)
+    except Exception as exc:
+        log.warning("[worker] CUDA pre-init failed (will try anyway): %s", exc)
 
     t = threading.Thread(target=_load_model_background, daemon=True, name="model-loader")
     t.start()
